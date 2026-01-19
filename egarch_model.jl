@@ -202,33 +202,46 @@ Uses the same intelligent reparametrization as EGARCH_block for numerical stabil
 end
 
 """
-    AR_EGARCH(returns, ar_order, log_vol_init)
+    ARX_EGARCH(returns, exog, ar_order, log_vol_init)
 
-AR(p)-EGARCH(1,1) model with autoregressive mean and EGARCH volatility.
+ARX(p)-EGARCH(1,1) model with autoregressive mean, exogenous variables, and EGARCH volatility.
 
 # Model specification
-- Mean: r_t = φ_0 + φ_1*r_{t-1} + ... + φ_p*r_{t-p} + ε_t
+- Mean: r_t = φ_0 + φ_1*r_{t-1} + ... + φ_p*r_{t-p} + β_1*x_{1,t} + ... + β_k*x_{k,t} + ε_t
 - Innovations: ε_t = σ_t * z_t, where z_t ~ N(0,1)
-- Log-volatility: log(σ²_t) = ω + α * g(z_{t-1}) + β * log(σ²_{t-1})
+- Log-volatility: log(σ²_t) = ω + α * g(z_{t-1}) + β_garch * log(σ²_{t-1})
 - Asymmetry: g(z) = θ*z + γ*(|z| - sqrt(2/π))
 
 # Arguments
 - `returns`: Vector of return observations
+- `exog`: Matrix of exogenous variables (T × k), or nothing for pure AR model
 - `ar_order`: AR order p (number of lags)
 - `log_vol_init`: Initial log-volatility (can be missing for estimation)
 
 # Parameters
 - φ_0: AR intercept
 - φ: Vector of AR coefficients [φ_1, ..., φ_p]
-- ω, α, β, θ, γ: EGARCH parameters (same as EGARCH_full)
+- β_exog: Vector of exogenous variable coefficients [β_1, ..., β_k] (if exog provided)
+- ω, α, β_garch, θ, γ: EGARCH parameters (same as EGARCH_full)
 
 # Stationarity
 - AR stationarity: Roots of characteristic polynomial outside unit circle
-- EGARCH stationarity: |β| < 1 (automatically satisfied by Beta prior)
+- EGARCH stationarity: |β_garch| < 1 (automatically satisfied by Beta prior)
+
+# Example
+```julia
+# ARX(1)-EGARCH with 2 exogenous variables
+exog = [interest_rates vix_index]  # T × 2 matrix
+model = ARX_EGARCH(returns, exog, 1)
+```
 """
-@model function AR_EGARCH(returns, ar_order::Int=1, log_vol_init=missing)
+@model function ARX_EGARCH(returns, exog=nothing, ar_order::Int=1, log_vol_init=missing)
     T = length(returns)
     p = ar_order
+
+    # Determine if exogenous variables are provided
+    has_exog = !isnothing(exog)
+    k = has_exog ? size(exog, 2) : 0  # number of exogenous variables
 
     # AR mean parameters
     φ_0 ~ Normal(0, 0.1)  # AR intercept
@@ -241,10 +254,18 @@ AR(p)-EGARCH(1,1) model with autoregressive mean and EGARCH volatility.
         φ[i] ~ truncated(Normal(0, 0.3 / i), -0.99, 0.99)  # Decay with lag
     end
 
+    # Exogenous variable coefficients
+    if has_exog
+        β_exog = Vector{typeof(φ_0)}(undef, k)
+        for j in 1:k
+            β_exog[j] ~ Normal(0, 1.0)  # Uninformative prior for exogenous effects
+        end
+    end
+
     # EGARCH volatility parameters (same reparametrization as before)
     ω ~ truncated(Normal(-1, 1), -5, 2)
     α ~ truncated(Normal(0, 0.3), -1, 1)
-    β ~ Beta(20, 2)
+    β_garch ~ Beta(20, 2)  # Renamed from β to avoid confusion with β_exog
     θ ~ truncated(Normal(-0.1, 0.2), -1, 0.5)
 
     # Log-normal reparametrization for γ
@@ -275,16 +296,23 @@ AR(p)-EGARCH(1,1) model with autoregressive mean and EGARCH volatility.
             end
         end
 
+        # Add exogenous contribution: β_1*x_{1,t} + ... + β_k*x_{k,t}
+        if has_exog
+            for j in 1:k
+                μ_t += β_exog[j] * exog[t, j]
+            end
+        end
+
         # Current volatility
         σ_t = safe_exp_half(log_vol)
 
-        # Observe return with AR mean and EGARCH volatility
+        # Observe return with ARX mean and EGARCH volatility
         returns[t] ~ Normal(μ_t, σ_t)
 
         # Update volatility for next period
         if t < T
             z_t = (returns[t] - μ_t) / σ_t
-            log_vol = update_log_volatility(log_vol, z_t, ω, α, β, θ, γ)
+            log_vol = update_log_volatility(log_vol, z_t, ω, α, β_garch, θ, γ)
         end
     end
 end
@@ -326,31 +354,40 @@ function generate_egarch_data(T::Int, μ, ω, α, β, θ, γ;
 end
 
 """
-    generate_ar_egarch_data(T, φ_0, φ, ω, α, β, θ, γ; log_vol_0=-2.0, seed=123)
+    generate_arx_egarch_data(T, φ_0, φ, β_exog, exog, ω, α, β_garch, θ, γ; log_vol_0=-2.0, seed=123)
 
-Generate synthetic data from an AR(p)-EGARCH(1,1) model.
+Generate synthetic data from an ARX(p)-EGARCH(1,1) model.
 
 # Arguments
 - `T`: Number of observations
 - `φ_0`: AR intercept
 - `φ`: Vector of AR coefficients [φ_1, ..., φ_p]
-- `ω, α, β, θ, γ`: EGARCH parameters
+- `β_exog`: Vector of exogenous coefficients [β_1, ..., β_k], or nothing for pure AR
+- `exog`: Matrix of exogenous variables (T × k), or nothing for pure AR
+- `ω, α, β_garch, θ, γ`: EGARCH parameters
 - `log_vol_0`: Initial log-volatility (default: -2.0)
 - `seed`: Random seed (default: 123)
 
 # Returns
 - NamedTuple with fields: returns, volatilities, log_volatilities, innovations, conditional_means
 
-# Example
+# Examples
 ```julia
-# AR(2)-EGARCH(1,1)
-data = generate_ar_egarch_data(500, 0.01, [0.3, 0.1], -0.5, 0.2, 0.85, -0.1, 0.6)
+# Pure AR(2)-EGARCH(1,1) (no exogenous variables)
+data = generate_arx_egarch_data(500, 0.01, [0.3, 0.1], nothing, nothing, -0.5, 0.2, 0.85, -0.1, 0.6)
+
+# ARX(1)-EGARCH(1,1) with 2 exogenous variables
+exog = randn(500, 2)  # 2 exogenous variables
+β_exog = [0.5, -0.3]  # their coefficients
+data = generate_arx_egarch_data(500, 0.01, [0.3], β_exog, exog, -0.5, 0.2, 0.85, -0.1, 0.6)
 ```
 """
-function generate_ar_egarch_data(T::Int, φ_0, φ::Vector, ω, α, β, θ, γ;
+function generate_arx_egarch_data(T::Int, φ_0, φ::Vector, β_exog, exog, ω, α, β_garch, θ, γ;
                                   log_vol_0=-2.0, seed=123)
     Random.seed!(seed)
     p = length(φ)
+    has_exog = !isnothing(exog) && !isnothing(β_exog)
+    k = has_exog ? size(exog, 2) : 0
 
     returns = zeros(T)
     log_vols = zeros(T)
@@ -362,6 +399,14 @@ function generate_ar_egarch_data(T::Int, φ_0, φ::Vector, ω, α, β, θ, γ;
     log_vols[1] = log_vol_0
     volatilities[1] = exp(log_vol_0 / 2)
     conditional_means[1] = φ_0  # Simple mean for t=1
+
+    # Add exogenous contribution at t=1
+    if has_exog
+        for j in 1:k
+            conditional_means[1] += β_exog[j] * exog[1, j]
+        end
+    end
+
     returns[1] = conditional_means[1] + volatilities[1] * innovations[1]
 
     for t in 2:T
@@ -378,9 +423,16 @@ function generate_ar_egarch_data(T::Int, φ_0, φ::Vector, ω, α, β, θ, γ;
             end
         end
 
+        # Add exogenous contribution
+        if has_exog
+            for j in 1:k
+                conditional_means[t] += β_exog[j] * exog[t, j]
+            end
+        end
+
         # Update volatility based on previous innovation
         z_prev = innovations[t-1]
-        log_vols[t] = update_log_volatility(log_vols[t-1], z_prev, ω, α, β, θ, γ)
+        log_vols[t] = update_log_volatility(log_vols[t-1], z_prev, ω, α, β_garch, θ, γ)
         volatilities[t] = exp(log_vols[t] / 2)
 
         # Generate return
@@ -397,12 +449,13 @@ function generate_ar_egarch_data(T::Int, φ_0, φ::Vector, ω, α, β, θ, γ;
 end
 
 """
-    fit_ar_egarch(returns; ar_order=1, n_samples=1000, n_chains=4, log_vol_init=missing)
+    fit_arx_egarch(returns; exog=nothing, ar_order=1, n_samples=1000, n_chains=4, log_vol_init=missing)
 
-Fit AR(p)-EGARCH(1,1) model to returns data using NUTS sampler.
+Fit ARX(p)-EGARCH(1,1) model to returns data using NUTS sampler.
 
 # Arguments
 - `returns`: Vector of return observations
+- `exog`: Matrix of exogenous variables (T × k), or nothing for pure AR model (default: nothing)
 - `ar_order`: AR order p (default: 1)
 - `n_samples`: Number of posterior samples per chain (default: 1000)
 - `n_chains`: Number of MCMC chains (default: 4)
@@ -411,27 +464,43 @@ Fit AR(p)-EGARCH(1,1) model to returns data using NUTS sampler.
 # Returns
 - Chains object with posterior samples
 
-# Example
+# Examples
 ```julia
-# Fit AR(1)-EGARCH(1,1)
-chain = fit_ar_egarch(returns, ar_order=1, n_samples=1000, n_chains=4)
+# Fit AR(1)-EGARCH(1,1) (no exogenous variables)
+chain = fit_arx_egarch(returns, ar_order=1, n_samples=1000, n_chains=4)
 
-# Extract AR coefficients
+# Fit ARX(1)-EGARCH(1,1) with exogenous variables
+exog = [interest_rates vix_index]  # T × 2 matrix
+chain = fit_arx_egarch(returns, exog=exog, ar_order=1, n_samples=1000, n_chains=4)
+
+# Extract parameters
 φ_0_samples = chain[:φ_0]
 φ_1_samples = chain[Symbol("φ[1]")]
+β_1_samples = chain[Symbol("β_exog[1]")]  # exogenous coefficient
 ```
 """
-function fit_ar_egarch(returns;
-                       ar_order=1,
-                       n_samples=1000,
-                       n_chains=4,
-                       log_vol_init=missing)
+function fit_arx_egarch(returns;
+                        exog=nothing,
+                        ar_order=1,
+                        n_samples=1000,
+                        n_chains=4,
+                        log_vol_init=missing)
 
-    println("Fitting AR($ar_order)-EGARCH(1,1) model")
+    has_exog = !isnothing(exog)
+    k = has_exog ? size(exog, 2) : 0
+
+    if has_exog
+        println("Fitting ARX($ar_order)-EGARCH(1,1) model with $k exogenous variable(s)")
+    else
+        println("Fitting AR($ar_order)-EGARCH(1,1) model")
+    end
     println("  Total observations: $(length(returns))")
     println("  AR order: $ar_order")
+    if has_exog
+        println("  Exogenous variables: $k")
+    end
 
-    model = AR_EGARCH(returns, ar_order, log_vol_init)
+    model = ARX_EGARCH(returns, exog, ar_order, log_vol_init)
 
     # Sample using NUTS
     println("\nStarting NUTS sampling...")
@@ -555,25 +624,25 @@ end
 
 # Export main functions
 export EGARCH_block, EGARCH_full, generate_egarch_data
-export AR_EGARCH, generate_ar_egarch_data, fit_ar_egarch
+export ARX_EGARCH, generate_arx_egarch_data, fit_arx_egarch
 export fit_egarch, forecast_volatility
 export asymmetry_function, update_log_volatility, safe_exp_half
 
 println("EGARCH module loaded successfully!")
 println("Main functions:")
 println("  - generate_egarch_data(): Generate synthetic EGARCH data")
-println("  - generate_ar_egarch_data(): Generate synthetic AR-EGARCH data")
+println("  - generate_arx_egarch_data(): Generate synthetic ARX-EGARCH data")
 println("  - fit_egarch(): Fit EGARCH model with configurable block size")
-println("  - fit_ar_egarch(): Fit AR(p)-EGARCH model")
+println("  - fit_arx_egarch(): Fit ARX(p)-EGARCH model")
 println("  - forecast_volatility(): Forecast future volatility")
 println()
 println("Models:")
 println("  • EGARCH(1,1): Constant mean + EGARCH volatility")
-println("  • AR(p)-EGARCH(1,1): Autoregressive mean + EGARCH volatility")
+println("  • ARX(p)-EGARCH(1,1): AR mean + exogenous variables + EGARCH volatility")
 println()
 println("Features:")
 println("  ✓ Intelligent reparametrization (log-normal for γ > 0)")
 println("  ✓ Numerical stability safeguards (clamped log-volatility)")
 println("  ✓ Truncated priors to prevent explosive behavior")
 println("  ✓ Automatic threading detection")
-println("  ✓ AR mean dynamics for time-varying conditional mean")
+println("  ✓ ARX mean dynamics with exogenous regressors")
