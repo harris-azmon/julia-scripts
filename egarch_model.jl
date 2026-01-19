@@ -21,10 +21,32 @@ end
 
 Update log-volatility using EGARCH(1,1) dynamics:
 log(σ²_t) = ω + α * g(z_{t-1}) + β * log(σ²_{t-1})
+
+Includes numerical stability bounds to prevent overflow.
+AD-compatible using min/max instead of clamp for Dual number support.
 """
 function update_log_volatility(log_vol_prev, z_prev, ω, α, β, θ, γ)
     g_z = asymmetry_function(z_prev, θ, γ)
-    return ω + α * g_z + β * log_vol_prev
+    new_log_vol = ω + α * g_z + β * log_vol_prev
+
+    # Clamp to prevent numerical overflow/underflow (AD-compatible)
+    # log(σ²) ∈ [-20, 10] => σ ∈ [exp(-10), exp(5)] ≈ [0.000045, 148]
+    # Use min(max(...)) instead of clamp() for AD compatibility
+    return min(max(new_log_vol, -20.0), 10.0)
+end
+
+"""
+    safe_exp_half(log_vol)
+
+Safely compute exp(log_vol / 2) with numerical bounds.
+This ensures σ = exp(log_vol / 2) > 0 and finite.
+AD-compatible implementation.
+"""
+function safe_exp_half(log_vol)
+    # Clamp before exponentiating (AD-compatible)
+    half_log_vol = log_vol / 2
+    clamped = min(max(half_log_vol, -10.0), 5.0)
+    return exp(clamped)
 end
 
 """
@@ -44,42 +66,63 @@ EGARCH(1,1) model with block-wise processing using scan.
 - Log-volatility: log(σ²_t) = ω + α * g(z_{t-1}) + β * log(σ²_{t-1})
 - Asymmetry: g(z) = θ*z + γ*(|z| - sqrt(2/π))
 
-# Parameters
+# Parameters (with intelligent reparametrization)
 - μ: mean return
-- ω: intercept in log-volatility
-- α: ARCH coefficient
-- β: GARCH coefficient (persistence)
+- ω: intercept in log-volatility (bounded to ensure stability)
+- α: ARCH coefficient (truncated to prevent explosive behavior)
+- β: GARCH coefficient (persistence, Beta prior ensures 0 < β < 1)
 - θ: leverage effect (typically < 0)
-- γ: magnitude effect (typically > 0)
+- γ: magnitude effect (always > 0, uses exp reparametrization)
+
+# Reparametrization Strategy
+- Log-volatility is naturally in unconstrained log-space
+- σ_t = exp(log_vol_t / 2) automatically ensures σ_t > 0
+- γ uses log-normal reparametrization: log_γ ~ Normal, γ = exp(log_γ)
+- α is truncated to [-1, 1] to prevent numerical instability
+- ω is truncated to reasonable range for log-volatility intercept
 """
 @model function EGARCH_block(returns, block_size, n_blocks, log_vol_init=missing)
     T = length(returns)
 
-    # Priors for EGARCH parameters
+    # Priors for EGARCH parameters with intelligent reparametrization
     μ ~ Normal(0, 0.1)
-    ω ~ Normal(-5, 2)
-    α ~ Normal(0, 0.5)
-    β ~ Beta(20, 2)  # Encourage high persistence (mean ≈ 0.91)
-    θ ~ Normal(-0.1, 0.3)  # Leverage effect, typically negative
-    γ ~ truncated(Normal(0.8, 0.5), 0.01, Inf)  # Magnitude effect
 
-    # Initial log-volatility
+    # Intercept: bounded to prevent unrealistic long-run volatility
+    ω ~ truncated(Normal(-1, 1), -5, 2)
+
+    # ARCH coefficient: truncated to ensure stability
+    α ~ truncated(Normal(0, 0.3), -1, 1)
+
+    # GARCH coefficient: Beta ensures 0 < β < 1 (stationarity)
+    β ~ Beta(20, 2)  # Encourage high persistence (mean ≈ 0.91)
+
+    # Leverage effect: typically negative
+    θ ~ truncated(Normal(-0.1, 0.2), -1, 0.5)
+
+    # Magnitude effect: REPARAMETRIZED for positivity
+    # Instead of γ ~ truncated(Normal(...), 0, Inf)
+    # Use: log_γ ~ Normal, then γ = exp(log_γ)
+    log_γ ~ Normal(log(0.5), 0.5)  # Prior centered at γ ≈ 0.5
+    γ = exp(log_γ)  # Ensures γ > 0 always
+
+    # Initial log-volatility: tighter bounds for stability
     if ismissing(log_vol_init)
-        log_vol_0 ~ Normal(-2, 1)  # Prior for initial log-volatility
+        log_vol_0 ~ truncated(Normal(-1, 0.5), -5, 1)
     else
         log_vol_0 = log_vol_init
     end
 
-    # Storage for standardized residuals
-    z = Vector{Float64}(undef, T)
-    log_vols = Vector{Float64}(undef, T)
+    # Storage for standardized residuals (AD-compatible: no explicit Float64)
+    z = Vector{typeof(μ)}(undef, T)
+    log_vols = Vector{typeof(log_vol_0)}(undef, T)
 
-    # Initial values
-    z[1] = (returns[1] - μ) / exp(log_vol_0/2)
+    # Initial values (using safe_exp_half for numerical stability)
+    σ_0 = safe_exp_half(log_vol_0)
+    z[1] = (returns[1] - μ) / σ_0
     log_vols[1] = log_vol_0
 
     # Process first observation
-    returns[1] ~ Normal(μ, exp(log_vol_0/2))
+    returns[1] ~ Normal(μ, σ_0)
 
     # Scan through blocks
     current_log_vol = log_vol_0
@@ -100,8 +143,8 @@ EGARCH(1,1) model with block-wise processing using scan.
             )
             log_vols[t] = current_log_vol
 
-            # Current volatility
-            σ_t = exp(current_log_vol / 2)
+            # Current volatility (using safe_exp_half for numerical stability)
+            σ_t = safe_exp_half(current_log_vol)
 
             # Observe return
             returns[t] ~ Normal(μ, σ_t)
@@ -120,21 +163,26 @@ end
 
 EGARCH(1,1) model processing the full time series at once.
 This is simpler but less memory efficient for large datasets.
+
+Uses the same intelligent reparametrization as EGARCH_block for numerical stability.
 """
 @model function EGARCH_full(returns, log_vol_init=missing)
     T = length(returns)
 
-    # Priors
+    # Priors with intelligent reparametrization (same as EGARCH_block)
     μ ~ Normal(0, 0.1)
-    ω ~ Normal(-5, 2)
-    α ~ Normal(0, 0.5)
+    ω ~ truncated(Normal(-1, 1), -5, 2)
+    α ~ truncated(Normal(0, 0.3), -1, 1)
     β ~ Beta(20, 2)
-    θ ~ Normal(-0.1, 0.3)
-    γ ~ truncated(Normal(0.8, 0.5), 0.01, Inf)
+    θ ~ truncated(Normal(-0.1, 0.2), -1, 0.5)
+
+    # Magnitude effect: log-normal reparametrization
+    log_γ ~ Normal(log(0.5), 0.5)
+    γ = exp(log_γ)
 
     # Initial log-volatility
     if ismissing(log_vol_init)
-        log_vol_0 ~ Normal(-2, 1)
+        log_vol_0 ~ truncated(Normal(-1, 0.5), -5, 1)
     else
         log_vol_0 = log_vol_init
     end
@@ -143,7 +191,7 @@ This is simpler but less memory efficient for large datasets.
     log_vol = log_vol_0
 
     for t in 1:T
-        σ_t = exp(log_vol / 2)
+        σ_t = safe_exp_half(log_vol)
         returns[t] ~ Normal(μ, σ_t)
 
         if t < T
@@ -274,7 +322,7 @@ function forecast_volatility(chain, returns, h=10; block_size=50)
 
         # Forward simulate through historical data to get final state
         for t in 1:T
-            σ_t = exp(log_vol / 2)
+            σ_t = safe_exp_half(log_vol)
             z_t = (returns[t] - μ) / σ_t
 
             if t < T
@@ -283,11 +331,11 @@ function forecast_volatility(chain, returns, h=10; block_size=50)
         end
 
         # Forecast
-        z_last = (returns[end] - μ) / exp(log_vol / 2)
+        z_last = (returns[end] - μ) / safe_exp_half(log_vol)
 
         for step in 1:h
             log_vol = update_log_volatility(log_vol, z_last, ω, α, β, θ, γ)
-            forecasts[i, step] = exp(log_vol / 2)
+            forecasts[i, step] = safe_exp_half(log_vol)
 
             # For next step, assume z_t = 0 (expected value)
             z_last = 0.0
@@ -300,10 +348,16 @@ end
 # Export main functions
 export EGARCH_block, EGARCH_full, generate_egarch_data
 export fit_egarch, forecast_volatility
-export asymmetry_function, update_log_volatility
+export asymmetry_function, update_log_volatility, safe_exp_half
 
 println("EGARCH module loaded successfully!")
 println("Main functions:")
 println("  - generate_egarch_data(): Generate synthetic EGARCH data")
 println("  - fit_egarch(): Fit EGARCH model with configurable block size")
 println("  - forecast_volatility(): Forecast future volatility")
+println()
+println("Features:")
+println("  ✓ Intelligent reparametrization (log-normal for γ > 0)")
+println("  ✓ Numerical stability safeguards (clamped log-volatility)")
+println("  ✓ Truncated priors to prevent explosive behavior")
+println("  ✓ Automatic threading detection")
