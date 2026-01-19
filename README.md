@@ -1,6 +1,47 @@
 # Julia Scripts
 
-This repository contains Julia scripts and programs.
+This repository contains Julia scripts for statistical modeling and time series analysis.
+
+## Contents
+
+- **`egarch_model.jl`** - EGARCH(1,1) model implementation using Turing.jl
+- **`simple_test.jl`** - Simple test demonstrating EGARCH functionality
+- **`test_egarch_full.jl`** - Comprehensive test with MCMC sampling
+- **`validate_syntax.jl`** - Syntax validation utility
+- **`INSTALLATION.md`** - Detailed installation notes and segfault fix documentation
+
+## Quick Start
+
+```bash
+# Set up Julia path
+export PATH="$HOME/.juliaup/bin:$PATH"
+
+# Run the simple test
+julia simple_test.jl
+
+# Or use the EGARCH model interactively
+julia
+```
+
+```julia
+include("egarch_model.jl")
+
+# Generate synthetic data
+data = generate_egarch_data(200, 0.0, -0.3, 0.15, 0.85, -0.05, 0.5)
+
+# Fit model (requires tuning for your data)
+chain = fit_egarch(data.returns, n_samples=1000, n_chains=4)
+```
+
+## Installed Packages
+
+- **Turing** (v0.42.4) - Probabilistic programming and Bayesian inference
+- **Distributions** - Probability distributions
+- **StatsBase** - Basic statistical functions
+- **LinearAlgebra** (stdlib) - Linear algebra operations
+- **Random** (stdlib) - Random number generation
+
+**Important:** See `INSTALLATION.md` for package installation details and segmentation fault fix.
 
 ## Julia Installation
 
