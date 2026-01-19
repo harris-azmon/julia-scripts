@@ -202,6 +202,94 @@ Uses the same intelligent reparametrization as EGARCH_block for numerical stabil
 end
 
 """
+    AR_EGARCH(returns, ar_order, log_vol_init)
+
+AR(p)-EGARCH(1,1) model with autoregressive mean and EGARCH volatility.
+
+# Model specification
+- Mean: r_t = φ_0 + φ_1*r_{t-1} + ... + φ_p*r_{t-p} + ε_t
+- Innovations: ε_t = σ_t * z_t, where z_t ~ N(0,1)
+- Log-volatility: log(σ²_t) = ω + α * g(z_{t-1}) + β * log(σ²_{t-1})
+- Asymmetry: g(z) = θ*z + γ*(|z| - sqrt(2/π))
+
+# Arguments
+- `returns`: Vector of return observations
+- `ar_order`: AR order p (number of lags)
+- `log_vol_init`: Initial log-volatility (can be missing for estimation)
+
+# Parameters
+- φ_0: AR intercept
+- φ: Vector of AR coefficients [φ_1, ..., φ_p]
+- ω, α, β, θ, γ: EGARCH parameters (same as EGARCH_full)
+
+# Stationarity
+- AR stationarity: Roots of characteristic polynomial outside unit circle
+- EGARCH stationarity: |β| < 1 (automatically satisfied by Beta prior)
+"""
+@model function AR_EGARCH(returns, ar_order::Int=1, log_vol_init=missing)
+    T = length(returns)
+    p = ar_order
+
+    # AR mean parameters
+    φ_0 ~ Normal(0, 0.1)  # AR intercept
+
+    # AR coefficients with stationarity-inducing priors
+    # For AR(1): φ_1 ~ Uniform(-0.99, 0.99) ensures stationarity
+    # For AR(p): use weaker priors and check stationarity post-hoc
+    φ = Vector{typeof(φ_0)}(undef, p)
+    for i in 1:p
+        φ[i] ~ truncated(Normal(0, 0.3 / i), -0.99, 0.99)  # Decay with lag
+    end
+
+    # EGARCH volatility parameters (same reparametrization as before)
+    ω ~ truncated(Normal(-1, 1), -5, 2)
+    α ~ truncated(Normal(0, 0.3), -1, 1)
+    β ~ Beta(20, 2)
+    θ ~ truncated(Normal(-0.1, 0.2), -1, 0.5)
+
+    # Log-normal reparametrization for γ
+    log_γ ~ Normal(log(0.5), 0.5)
+    γ = exp(log_γ)
+
+    # Initial log-volatility
+    if ismissing(log_vol_init)
+        log_vol_0 ~ truncated(Normal(-1, 0.5), -5, 1)
+    else
+        log_vol_0 = log_vol_init
+    end
+
+    # Initialize
+    log_vol = log_vol_0
+
+    # Process time series (start from t = p+1 after AR lag)
+    for t in 1:T
+        # Compute AR mean
+        if t <= p
+            # For initial observations, use simpler mean
+            μ_t = φ_0
+        else
+            # AR mean: φ_0 + φ_1*r_{t-1} + ... + φ_p*r_{t-p}
+            μ_t = φ_0
+            for i in 1:p
+                μ_t += φ[i] * returns[t - i]
+            end
+        end
+
+        # Current volatility
+        σ_t = safe_exp_half(log_vol)
+
+        # Observe return with AR mean and EGARCH volatility
+        returns[t] ~ Normal(μ_t, σ_t)
+
+        # Update volatility for next period
+        if t < T
+            z_t = (returns[t] - μ_t) / σ_t
+            log_vol = update_log_volatility(log_vol, z_t, ω, α, β, θ, γ)
+        end
+    end
+end
+
+"""
     generate_egarch_data(T, μ, ω, α, β, θ, γ; log_vol_0=-2.0, seed=123)
 
 Generate synthetic data from an EGARCH(1,1) model.
@@ -235,6 +323,126 @@ function generate_egarch_data(T::Int, μ, ω, α, β, θ, γ;
         log_volatilities = log_vols,
         innovations = innovations
     )
+end
+
+"""
+    generate_ar_egarch_data(T, φ_0, φ, ω, α, β, θ, γ; log_vol_0=-2.0, seed=123)
+
+Generate synthetic data from an AR(p)-EGARCH(1,1) model.
+
+# Arguments
+- `T`: Number of observations
+- `φ_0`: AR intercept
+- `φ`: Vector of AR coefficients [φ_1, ..., φ_p]
+- `ω, α, β, θ, γ`: EGARCH parameters
+- `log_vol_0`: Initial log-volatility (default: -2.0)
+- `seed`: Random seed (default: 123)
+
+# Returns
+- NamedTuple with fields: returns, volatilities, log_volatilities, innovations, conditional_means
+
+# Example
+```julia
+# AR(2)-EGARCH(1,1)
+data = generate_ar_egarch_data(500, 0.01, [0.3, 0.1], -0.5, 0.2, 0.85, -0.1, 0.6)
+```
+"""
+function generate_ar_egarch_data(T::Int, φ_0, φ::Vector, ω, α, β, θ, γ;
+                                  log_vol_0=-2.0, seed=123)
+    Random.seed!(seed)
+    p = length(φ)
+
+    returns = zeros(T)
+    log_vols = zeros(T)
+    volatilities = zeros(T)
+    innovations = randn(T)
+    conditional_means = zeros(T)
+
+    # Initialize
+    log_vols[1] = log_vol_0
+    volatilities[1] = exp(log_vol_0 / 2)
+    conditional_means[1] = φ_0  # Simple mean for t=1
+    returns[1] = conditional_means[1] + volatilities[1] * innovations[1]
+
+    for t in 2:T
+        # Compute AR mean
+        if t <= p
+            conditional_means[t] = φ_0
+            for i in 1:(t-1)
+                conditional_means[t] += φ[i] * returns[t - i]
+            end
+        else
+            conditional_means[t] = φ_0
+            for i in 1:p
+                conditional_means[t] += φ[i] * returns[t - i]
+            end
+        end
+
+        # Update volatility based on previous innovation
+        z_prev = innovations[t-1]
+        log_vols[t] = update_log_volatility(log_vols[t-1], z_prev, ω, α, β, θ, γ)
+        volatilities[t] = exp(log_vols[t] / 2)
+
+        # Generate return
+        returns[t] = conditional_means[t] + volatilities[t] * innovations[t]
+    end
+
+    return (
+        returns = returns,
+        volatilities = volatilities,
+        log_volatilities = log_vols,
+        innovations = innovations,
+        conditional_means = conditional_means
+    )
+end
+
+"""
+    fit_ar_egarch(returns; ar_order=1, n_samples=1000, n_chains=4, log_vol_init=missing)
+
+Fit AR(p)-EGARCH(1,1) model to returns data using NUTS sampler.
+
+# Arguments
+- `returns`: Vector of return observations
+- `ar_order`: AR order p (default: 1)
+- `n_samples`: Number of posterior samples per chain (default: 1000)
+- `n_chains`: Number of MCMC chains (default: 4)
+- `log_vol_init`: Initial log-volatility (missing for estimation)
+
+# Returns
+- Chains object with posterior samples
+
+# Example
+```julia
+# Fit AR(1)-EGARCH(1,1)
+chain = fit_ar_egarch(returns, ar_order=1, n_samples=1000, n_chains=4)
+
+# Extract AR coefficients
+φ_0_samples = chain[:φ_0]
+φ_1_samples = chain[Symbol("φ[1]")]
+```
+"""
+function fit_ar_egarch(returns;
+                       ar_order=1,
+                       n_samples=1000,
+                       n_chains=4,
+                       log_vol_init=missing)
+
+    println("Fitting AR($ar_order)-EGARCH(1,1) model")
+    println("  Total observations: $(length(returns))")
+    println("  AR order: $ar_order")
+
+    model = AR_EGARCH(returns, ar_order, log_vol_init)
+
+    # Sample using NUTS
+    println("\nStarting NUTS sampling...")
+
+    # Use MCMCThreads() if multiple threads available, otherwise MCMCSerial()
+    sampler_type = Threads.nthreads() > 1 ? MCMCThreads() : MCMCSerial()
+
+    chain = sample(model, NUTS(0.65), sampler_type, n_samples, n_chains,
+                   progress=true)
+
+    return chain
 end
 
 """
@@ -347,17 +555,25 @@ end
 
 # Export main functions
 export EGARCH_block, EGARCH_full, generate_egarch_data
+export AR_EGARCH, generate_ar_egarch_data, fit_ar_egarch
 export fit_egarch, forecast_volatility
 export asymmetry_function, update_log_volatility, safe_exp_half
 
 println("EGARCH module loaded successfully!")
 println("Main functions:")
 println("  - generate_egarch_data(): Generate synthetic EGARCH data")
+println("  - generate_ar_egarch_data(): Generate synthetic AR-EGARCH data")
 println("  - fit_egarch(): Fit EGARCH model with configurable block size")
+println("  - fit_ar_egarch(): Fit AR(p)-EGARCH model")
 println("  - forecast_volatility(): Forecast future volatility")
+println()
+println("Models:")
+println("  • EGARCH(1,1): Constant mean + EGARCH volatility")
+println("  • AR(p)-EGARCH(1,1): Autoregressive mean + EGARCH volatility")
 println()
 println("Features:")
 println("  ✓ Intelligent reparametrization (log-normal for γ > 0)")
 println("  ✓ Numerical stability safeguards (clamped log-volatility)")
 println("  ✓ Truncated priors to prevent explosive behavior")
 println("  ✓ Automatic threading detection")
+println("  ✓ AR mean dynamics for time-varying conditional mean")
